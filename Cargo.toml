@@ -1,0 +1,20 @@
+[package]
+name = "hogfold"
+version = "0.1.0"
+authors = ["Felix Obenhuber <felix@obenhuber.de>"]
+license = "MIT"
+edition = "2018"
+
+[dependencies]
+bytes = "0.4.12"
+env_logger = "0.6.1"
+failure = "0.1.5"
+log = "0.4.6"
+mqtt3 = { git = "https://github.com/flxo/mqtt3" }
+tokio = { version = "0.1.18", features = ["async-await-preview"] }
+
+[profile.test]
+debug = false
+
+[profile.dev]
+debug = false
