@@ -18,82 +18,41 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::codec;
-use log::{error, info, trace, warn};
-use mqtt3::{Connack, ConnectReturnCode, Packet, PacketIdentifier, Publish, QoS, Suback, Subscribe, SubscribeReturnCodes, SubscribeTopic};
-use std::{collections::HashMap, net::SocketAddr};
+use crate::{client::Client, client_id::ClientId, subscriptions::Subscriptions};
+use bytes::Bytes;
+use hashbrown::HashMap;
+use log::{info, trace, warn};
+use mqtt_codec::{QoS, *};
+use std::{net::SocketAddr, str::FromStr};
 use tokio::{
     codec::Framed,
     net::TcpStream,
     prelude::{Stream, *},
+    runtime::Runtime,
     sync::mpsc,
 };
-// use tokio::timer::Interval;
-// use tokio::timer::Delay;
-// use std::time::Duration;
-// use std::time::Instant;
-use crate::{client::Client, subscriptions::Subscriptions};
-use std::{
-    cmp,
-    collections::hash_map::DefaultHasher,
-    fmt,
-    hash::{Hash, Hasher},
-};
 
-#[derive(Clone, Debug)]
-pub struct ClientId {
-    id: String,
-    // Cache hash for id
-    hash: u64,
-}
-
-impl ClientId {
-    pub fn new(id: &str) -> ClientId {
-        let mut hasher = DefaultHasher::new();
-        id.hash(&mut hasher);
-        ClientId {
-            id: id.to_string(),
-            hash: hasher.finish(),
-        }
-    }
-}
-
-impl Hash for ClientId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
-
-impl cmp::PartialEq for ClientId {
-    fn eq(&self, other: &ClientId) -> bool {
-        self.hash == other.hash
-    }
-}
-impl Eq for ClientId {}
-
-impl fmt::Display for ClientId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.id)
-    }
-}
-
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     Packet(SocketAddr, Packet),
-    Connected(TcpStream),
+    Connection((SocketAddr, TcpStream)),
+    ClientConnected(SocketAddr, Connect, mpsc::Sender<Packet>),
     Disconnected(SocketAddr),
 }
 
+#[derive(Debug)]
 pub struct Broker {
     tx: mpsc::Sender<Event>,
     clients: HashMap<ClientId, Client>,
     connections: HashMap<SocketAddr, ClientId>,
     subscriptions: Subscriptions,
-    retains: HashMap<SubscribeTopic, Publish>,
+    retains: HashMap<string::String<Bytes>, Publish>,
 }
 
 impl Broker {
-    pub fn start() -> mpsc::Sender<Event> {
-        let (tx, mut rx) = mpsc::channel::<Event>(100);
+    pub fn start(runtime: &mut Runtime) -> mpsc::Sender<Event> {
+        let (tx, rx) = mpsc::channel::<Event>(100);
 
         let mut broker = Broker {
             tx: tx.clone(),
@@ -103,30 +62,33 @@ impl Broker {
             retains: HashMap::new(),
         };
 
-        tokio::spawn_async(async move {
-            while let Some(event) = await!(rx.next()) {
-                await!(broker.handle_event(event.unwrap()));
-            }
-        });
+        runtime.spawn(
+            rx.for_each(move |event| {
+                broker.handle_event(event);
+                Ok(())
+            })
+            .map_err(drop)
+            .map(drop),
+        );
         tx
     }
 
-    pub async fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Packet(sender, packet) => {
-                await!(self.handle_packet(sender, packet));
+            Event::ClientConnected(addr, connect, tx) => {
+                self.handle_client_connected(addr, connect, tx);
             }
-            Event::Connected(stream) => {
-                await!(self.handle_connect(stream));
+            Event::Packet(sender, packet) => {
+                self.handle_packet(sender, packet);
             }
             Event::Disconnected(addr) => {
                 self.handle_disconnect(addr);
             }
+            Event::Connection((addr, stream)) => self.handle_connect(addr, stream),
         };
     }
 
-    pub async fn handle_packet(&mut self, sender: SocketAddr, packet: Packet) {
-        trace!("Inbound packet from {}: {:#?} ", sender, packet);
+    fn handle_packet(&mut self, sender: SocketAddr, packet: Packet) {
         let client_id = if let Some(client) = self.connections.get(&sender) {
             client.clone()
         } else {
@@ -135,182 +97,287 @@ impl Broker {
         };
 
         match packet {
-            Packet::Subscribe(subscribe) => {
-                await!(self.handle_subscribe(&client_id, &subscribe));
-            }
-            Packet::Publish(mut publish) => {
-                await!(self.handle_publish(&client_id, &mut publish));
-            }
-            Packet::Puback(pkid) => self.handle_puback(&client_id, pkid),
-            Packet::Pingreq => {
-                await!(self.handle_pingreq(&client_id));
-            }
-            _ => unimplemented!(),
+            Packet::Subscribe {
+                packet_id,
+                mut topic_filters,
+            } => self.handle_subscribe(&client_id, packet_id, &mut topic_filters),
+            Packet::Unsubscribe {
+                packet_id,
+                mut topic_filters,
+            } => self.handle_unsubscribe(&client_id, packet_id, &mut topic_filters),
+            Packet::Publish(mut publish) => self.handle_publish(&client_id, &mut publish),
+            Packet::PublishAck { packet_id } => self.handle_puback(&client_id, packet_id),
+            Packet::PublishRelease { packet_id } => self.handle_pubrel(&client_id, packet_id),
+            Packet::PublishComplete { packet_id } => self.handle_pubcomp(&client_id, packet_id),
+            Packet::PublishReceived { packet_id } => self.handle_pubrec(&client_id, packet_id),
+            Packet::PingRequest => self.handle_pingreq(&client_id),
+            // The connect packet is handled before. This is a Connect received on a
+            // established connection
+            Packet::Connect(_) | Packet::Disconnect => self.handle_disconnect(sender),
+            p => panic!("Unimplemented packet: {:?}", p),
         };
     }
 
-    fn handle_puback(&mut self, client_id: &ClientId, pkid: PacketIdentifier) {
+    fn handle_puback(&mut self, client_id: &ClientId, packet_id: u16) {
         if let Some(ref mut client) = self.clients.get_mut(client_id) {
-            client.handle_puback(pkid);
+            client.handle_puback(packet_id);
+        } else {
+            warn!("Cannot handle PublishAck({}) from unknown client {}", packet_id, client_id);
         }
     }
 
-    async fn handle_subscribe<'a>(&'a mut self, client_id: &'a ClientId, subscribe: &'a Subscribe) {
+    fn handle_pubrel(&mut self, client_id: &ClientId, packet_id: u16) {
         if let Some(ref mut client) = self.clients.get_mut(client_id) {
-            let pkid = subscribe.pid;
-            let mut return_codes = Vec::new();
-            let mut successful_subscriptions = Vec::new();
-            for topic in subscribe.topics.clone() {
-                return_codes.push(SubscribeReturnCodes::Success(topic.qos));
-                successful_subscriptions.push(topic.clone());
-                self.subscriptions.add_subscription(topic, client_id.clone()).unwrap(); // TODO: handle error
+            let publish = client.handle_pubrel(packet_id).expect("internal error");
+            let qos = publish.qos;
+
+            match std::str::from_utf8(publish.topic.get_ref())
+                .map_err(drop)
+                .and_then(|s| Topic::from_str(s).map_err(drop))
+            {
+                Ok(topic) => {
+                    let subscriptions = self.subscriptions.get_subscriptions(&topic);
+                    for s in subscriptions {
+                        if let Some(client) = self.clients.get_mut(&s.client_id) {
+                            match qos {
+                                QoS::AtLeastOnce => client.outgoing_pub.push_back(publish.clone()),
+                                QoS::ExactlyOnce => client.outgoing_rec.push_back(publish.clone()),
+                                _ => (),
+                            }
+                            client.send(Packet::Publish(publish.clone()));
+                        }
+                    }
+                }
+                Err(_) => {
+                    warn!("Invalid topic in pubrel");
+                    return;
+                }
+            }
+        } else {
+            warn!("Cannot handle PublishRelease({}) from unknown client {}", packet_id, client_id);
+        }
+    }
+
+    fn handle_pubcomp(&mut self, client_id: &ClientId, packet_id: u16) {
+        if let Some(ref mut client) = self.clients.get_mut(client_id) {
+            client.handle_pubcomp(packet_id);
+        } else {
+            warn!("Cannot handle PublishComplete({}) from unknown client {}", packet_id, client_id);
+        }
+    }
+
+    fn handle_pubrec(&mut self, client_id: &ClientId, packet_id: u16) {
+        if let Some(ref mut _client) = self.clients.get_mut(client_id) {
+            //let _publish = client.handle_pubrel(packet_id).expect("internal error");
+            // TODO
+        } else {
+            warn!("Cannot handle PublishReceived({}) from unknown client {}", packet_id, client_id);
+        }
+    }
+
+    fn handle_subscribe<'a>(&'a mut self, client_id: &'a ClientId, packet_id: u16, topic_filters: &'a mut Vec<(string::String<Bytes>, QoS)>) {
+        if let Some(client) = self.clients.get_mut(client_id) {
+            let mut status = Vec::new();
+            let mut retains = Vec::new();
+            for (topic, qos) in topic_filters.drain(..) {
+                match std::str::from_utf8(topic.get_ref())
+                    .map_err(|_| ())
+                    .and_then(|s| Topic::from_str(s).map_err(|_| ()))
+                {
+                    Ok(topic) => {
+                        for (retain_topic, retain_publish) in &self.retains {
+                            match std::str::from_utf8(retain_topic.get_ref())
+                                .map_err(|_| ())
+                                .and_then(|s| Topic::from_str(s).map_err(|_| ()))
+                            {
+                                Ok(rt) => {
+                                    if topic == rt {
+                                        retains.push(retain_publish.clone());
+                                    }
+                                }
+                                Err(_) => warn!("Invalid retain topic {}", retain_topic),
+                            }
+                        }
+
+                        status.push(SubscribeReturnCode::Success(qos));
+                        self.subscriptions.add_subscription(topic, client_id.clone(), qos);
+                    }
+                    Err(_) => status.push(SubscribeReturnCode::Failure),
+                }
             }
 
-            let suback = Suback { pid: pkid, return_codes };
-            let packet = Packet::Suback(suback);
+            let packet = Packet::SubscribeAck { packet_id, status };
 
-            await!(client.send(packet));
-        } else {
-            warn!("Cannot subscribe unknown client {:?}", client_id);
+            client.send(packet);
+            for publish in retains.drain(..) {
+                client.publish(publish);
+            }
+        }
+    }
+
+    fn handle_unsubscribe<'a>(&'a mut self, client_id: &'a ClientId, packet_id: u16, _topic_filters: &'a mut Vec<string::String<Bytes>>) {
+        if let Some(client) = self.clients.get_mut(client_id) {
+            // TODO
+            client.send(Packet::UnsubscribeAck { packet_id });
         }
     }
 
     /// Forward a publication to all subscribed clients
-    async fn forward<'a>(&'a mut self, publish: &'a Publish) {
-        for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce].iter() {
-            let subscribe_topic = SubscribeTopic {
-                topic_path: publish.topic_name.clone(),
-                qos: *qos,
-            };
-
-            if let Ok(clients) = self.subscriptions.get_subscribed_clients(subscribe_topic) {
-                for client_id in clients {
-                    if let Some(ref mut client) = self.clients.get_mut(&client_id) {
-                        await!(client.publish(publish.clone()));
+    fn forward<'a>(&'a mut self, publish: &'a Publish) {
+        match std::str::from_utf8(publish.topic.get_ref())
+            .map_err(|_| ())
+            .and_then(|s| Topic::from_str(s).map_err(|_| ()))
+        {
+            Ok(topic) => {
+                let subscriptions = self.subscriptions.get_subscriptions(&topic);
+                for s in subscriptions {
+                    if let Some(client) = self.clients.get_mut(&s.client_id) {
+                        let mut publish = publish.clone();
+                        if publish.qos as u8 > s.qos as u8 {
+                            publish.qos = s.qos;
+                        }
+                        client.publish(publish.clone());
                     }
                 }
+            }
+            Err(_) => {
+                warn!("Invalid topic in publish");
+                return;
             }
         }
     }
 
-    pub async fn handle_publish<'a>(&'a mut self, client_id: &'a ClientId, publish: &'a mut Publish) {
-        info!("Publish: {:?}", publish);
-        let pkid = publish.pid;
-        let qos = publish.qos;
-
+    fn handle_publish(&mut self, client_id: &ClientId, publish: &mut Publish) {
         if publish.retain {
             self.store_retain(publish.clone());
-            publish.retain = false;
         }
 
-        match qos {
-            QoS::AtMostOnce => (),
-            QoS::AtLeastOnce => {
-                if let Some(pkid) = pkid {
-                    if let Some(ref mut client) = self.clients.get_mut(client_id) {
-                        await!(client.send(Packet::Puback(pkid)));
-                    }
-                } else {
-                    error!("Ignoring publish packet. No pkid for QoS1 packet");
+        if let Some(client) = self.clients.get_mut(client_id) {
+            client.handle_publish(publish);
+        } else {
+            warn!("Publish from unknown client {}", client_id);
+        }
+
+        self.forward(publish);
+    }
+
+    fn handle_disconnect(&mut self, addr: SocketAddr) {
+        if let Some(client_id) = self.connections.remove(&addr) {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.connection.take();
+                if client.clean_session {
+                    self.clients.remove(&client_id);
                 }
             }
-            QoS::ExactlyOnce => unimplemented!(),
+            self.subscriptions.remove_client(&client_id);
+            info!("{}: Disconnnected ({:?})", client_id, addr);
+        }
+    }
+
+    fn handle_pingreq<'a>(&'a mut self, client_id: &'a ClientId) {
+        if let Some(client) = self.clients.get_mut(client_id) {
+            client.send(Packet::PingResponse);
+        }
+    }
+
+    fn handle_client_connected(&mut self, addr: SocketAddr, connect: Connect, tx: mpsc::Sender<Packet>) {
+        let id = ClientId::new(&connect.client_id);
+        let session_present = if connect.clean_session {
+            let client = Client::new(self.tx.clone(), tx, addr, connect.clean_session);
+            self.clients.insert(id.clone(), client);
+            false
+        } else if let Some(mut client) = self.clients.get_mut(&id) {
+            client.connection = Some(crate::client::Connection { tx, addr });
+            client.clean_session = false;
+            // TODO update session
+            true
+        } else {
+            let id = ClientId::new(&connect.client_id);
+            let client = Client::new(self.tx.clone(), tx, addr, connect.clean_session);
+            self.clients.insert(id.clone(), client);
+            false
+        };
+        self.connections.insert(addr, id.clone());
+
+        let connack = Packet::ConnectAck {
+            session_present,
+            return_code: ConnectCode::ConnectionAccepted,
         };
 
-        await!(self.forward(publish));
+        self.clients.get_mut(&id).map(|client| client.send(connack)).expect("TODO");
     }
 
-    pub fn handle_disconnect(&mut self, addr: SocketAddr) {
-        if let Some(client_id) = self.connections.remove(&addr) {
-            info!("Client disconnnected: {} ({:?})", client_id, addr);
-            self.clients.remove(&client_id);
-            self.subscriptions.remove_client(&client_id);
-        }
-    }
+    fn handle_connect(&mut self, addr: SocketAddr, stream: TcpStream) {
+        let (sink, stream) = Framed::new(stream, mqtt_codec::Codec::new()).split();
 
-    pub async fn handle_pingreq<'a>(&'a mut self, client_id: &'a ClientId) {
-        if let Some(ref mut client) = self.clients.get_mut(client_id) {
-            trace!("Sending Pingresponse to {:?}", client_id);
-            await!(client.send(Packet::Pingresp));
-        }
-    }
+        let broker = self.tx.clone();
+        let broker_done = self.tx.clone();
 
-    pub async fn handle_connect(&mut self, stream: TcpStream) {
-        let addr = stream.peer_addr().unwrap();
-        let (mut sink, mut stream) = Framed::new(stream, codec::MqttCodec).split();
-        if let Some(Ok(Packet::Connect(connect))) = await!(stream.next()) {
-            assert!(connect.clean_session);
-            trace!("Connect from {} {:#?}", addr, connect);
+        let client = stream
+            .into_future()
+            .and_then(move |(packet, stream)| {
+                if let Some(Packet::Connect(connect)) = packet {
+                    trace!("{} ⟹  {:?}", addr, connect);
 
-            let (client_tx, mut client_rx) = mpsc::channel(100);
+                    let (client_tx, client_rx) = mpsc::channel(100);
 
-            // From client
-            let mut broker_tx = self.tx.clone();
-            tokio::spawn_async(async move {
-                while let Some(packet) = await!(stream.next()) {
-                    match packet {
-                        Ok(packet) => await!(broker_tx.send_async(Event::Packet(addr, packet))).unwrap(),
-                        Err(e) => {
-                            warn!("Error on connection to {}: {}", addr, e);
-                            break; // io::Error
-                        }
-                    }
+                    broker
+                        .clone()
+                        .send(Event::ClientConnected(addr, connect, client_tx))
+                        .wait()
+                        .expect("Channel error");
+
+                    // To client
+                    let tx = broker.clone();
+                    tokio::spawn(
+                        client_rx
+                            .map_err(|e| {
+                                warn!("Error in client Receiver: {}", e);
+                            })
+                            .inspect(move |p| trace!("{} ⟸  {:?}", addr, p))
+                            .forward(sink.sink_map_err(|e| warn!("Client rx error {:?}", e)))
+                            .map(drop)
+                            .then(move |r| {
+                                info!("{} ⟹  Connection closed: {:?}", addr, r);
+                                tx.send(Event::Disconnected(addr)).wait().expect("Channel error");
+                                Ok(())
+                            }),
+                    );
+
+                    // From client
+                    let tx = broker.clone();
+                    tokio::spawn(
+                        stream
+                            .inspect(move |p| trace!("{} ⟹  {:?}", addr, p))
+                            .inspect_err(move |e| trace!("{} ⟹  {:?}", addr, e))
+                            .map(move |p| Event::Packet(addr, p))
+                            .or_else(move |e| {
+                                info!("{} ⟹  Connection closed: {:?}", addr, e);
+                                Ok::<_, ()>(Event::Disconnected(addr))
+                            })
+                            .forward(tx.sink_map_err(|e| trace!("Client Sink error {}", e)))
+                            .map(move |_| {
+                                info!("{} ⟹  Connection closed", addr);
+                                broker_done.send(Event::Disconnected(addr)).wait().expect("Channel error");
+                            }),
+                    );
+                } else {
+                    warn!("{} ⟹  Unexpected packet: {:?}", addr, packet);
                 }
-                await!(broker_tx.send_async(Event::Disconnected(addr))).unwrap();
-            });
+                Ok(())
+            })
+            .map_err(drop)
+            .map(drop);
 
-            // To client
-            let mut broker_tx = self.tx.clone();
-            tokio::spawn_async(async move {
-                while let Some(packet) = await!(client_rx.next()) {
-                    if let Ok(packet) = packet {
-                        if let Err(e) = await!(sink.send_async(packet)) {
-                            trace!("Failed to send to {}: {}", addr, e);
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                await!(broker_tx.send_async(Event::Disconnected(addr))).unwrap();
-            });
-
-            let connack = Packet::Connack(Connack {
-                session_present: false,
-                code: ConnectReturnCode::Accepted,
-            });
-
-            let id = ClientId::new(&connect.client_id);
-            let mut client = Client::new(self.tx.clone(), client_tx, addr);
-            await!(client.send(connack));
-            self.clients.insert(id.clone(), client);
-            self.connections.insert(addr, id);
-;
-        // Pings
-        // let duration = Duration::from_secs(u64::from(connect.keep_alive));
-        // let id = connect.client_id;
-        // tokio::spawn_async(async move {
-        //     loop {
-        //         await!(Delay::new(Instant::now() + duration));
-        //         debug!("Sending ping to {}", id)
-        //         //await!(broker_tx.send_async(Event::Packet(addr, packet))).unwrap();
-        //     }
-        // });
-        } else {
-            warn!("Invalid connection attempt from {}", addr);
-        }
+        tokio::spawn(client);
     }
 
     fn store_retain(&mut self, publish: Publish) {
-        let retain_subscription = SubscribeTopic {
-            topic_path: publish.topic_name.clone(),
-            qos: publish.qos,
-        };
         if publish.payload.is_empty() {
             // Remove existing retains if new retain publish's payload len = 0
-            self.retains.remove(&retain_subscription);
+            self.retains.remove(&publish.topic);
         } else {
-            self.retains.insert(retain_subscription, publish);
+            self.retains.insert(publish.topic.clone(), publish);
         }
     }
 }

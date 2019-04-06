@@ -9,9 +9,11 @@ edition = "2018"
 bytes = "0.4.12"
 env_logger = "0.6.1"
 failure = "0.1.5"
+hashbrown = "0.2.0"
 log = "0.4.6"
-mqtt3 = { git = "https://github.com/flxo/mqtt3" }
-tokio = { version = "0.1.18", features = ["async-await-preview"] }
+mqtt-codec = { git = "https://github.com/fafhrd91/mqtt-codec.git" }
+string = "0.1.3"
+tokio = { version = "0.1.18" }
 
 [profile.test]
 debug = false

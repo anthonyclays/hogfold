@@ -17,35 +17,44 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-
-#![feature(await_macro, async_await, futures_api)]
-
+use failure::Error;
 use log::info;
+use mqtt_codec::TCP_PORT;
 use std::{env, net::SocketAddr};
-use tokio::{await, net::TcpListener, prelude::*};
-mod codec;
+use tokio::{net::TcpListener, prelude::*};
 
 mod broker;
 mod client;
+mod client_id;
 mod subscriptions;
 
-fn main() {
-    env::set_var("RUST_LOG", "hogfold=debug");
+fn main() -> Result<(), Error> {
+    #[cfg(debug_assertions)]
+    env::set_var("RUST_LOG", "hogfold=trace");
+    #[cfg(not(debug_assertions))]
+    env::set_var("RUST_LOG", "hogfold=info");
     env_logger::init();
 
-    let addr = "[::1]:1883".parse::<SocketAddr>().unwrap();
-    info!("Binding {}", addr);
-    let listener = TcpListener::bind(&addr).unwrap();
+    let mut runtime = tokio::runtime::Runtime::new()?;
+    let broker = broker::Broker::start(&mut runtime);
+    let v6_addr = format!("[::1]:{}", TCP_PORT).parse::<SocketAddr>().unwrap();
+    let v4_addr = format!("127.0.0.1:{}", TCP_PORT).parse::<SocketAddr>().unwrap();
 
-    tokio::run_async(async {
-        let mut broker = broker::Broker::start();
-        let mut incoming = listener.incoming();
+    info!("Binding {}", v4_addr);
+    let v4_listener = TcpListener::bind(&v4_addr)?;
+    info!("Binding {}", v6_addr);
+    let v6_listener = TcpListener::bind(&v6_addr)?;
 
-        while let Some(stream) = await!(incoming.next()) {
-            let stream = stream.unwrap();
-            let addr = stream.peer_addr().unwrap();
-            info!("Connection from {}", addr);
-            await!(broker.send_async(broker::Event::Connected(stream))).ok();
-        }
-    });
+    tokio::run(
+        v4_listener
+            .incoming()
+            .select(v6_listener.incoming())
+            .and_then(|stream| stream.peer_addr().map(|addr| (addr, stream)))
+            .map(broker::Event::Connection)
+            .map_err(drop)
+            .forward(broker.sink_map_err(drop))
+            .map(drop)
+            .map_err(drop),
+    );
+    Ok(())
 }

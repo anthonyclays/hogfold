@@ -18,86 +18,67 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::broker::ClientId;
+use crate::client_id::ClientId;
 use failure::Error;
-use mqtt3::{SubscribeTopic, ToTopicPath, TopicPath};
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
+use mqtt_codec::*;
+use std::{
+    cmp,
+    hash::{Hash, Hasher},
+};
 
 #[derive(Debug, Default)]
-pub struct Subscriptions {
-    concrete: HashMap<SubscribeTopic, HashSet<ClientId>>,
-    wild: HashMap<SubscribeTopic, HashSet<ClientId>>,
+pub struct Subscriptions(HashMap<Topic, HashSet<Subscription>>);
+
+#[derive(Debug, Clone)]
+pub struct Subscription {
+    pub client_id: ClientId,
+    pub qos: QoS,
 }
 
-impl Subscriptions {
-    pub fn add_subscription(&mut self, topic: SubscribeTopic, client_id: ClientId) -> Result<(), Error> {
-        let topic_path = TopicPath::from_str(topic.topic_path.clone())?;
+impl Hash for Subscription {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.client_id.hash(state);
+    }
+}
 
-        if topic_path.wildcards {
-            let clients = self.wild.entry(topic).or_insert_with(HashSet::new);
-            clients.insert(client_id);
-        } else {
-            let clients = self.concrete.entry(topic).or_insert_with(HashSet::new);
-            clients.insert(client_id);
-        }
-        Ok(())
+impl cmp::PartialEq for Subscription {
+    fn eq(&self, other: &Subscription) -> bool {
+        // Compare only client_id
+        self.client_id == other.client_id
+    }
+}
+
+impl Eq for Subscription {}
+
+impl Subscriptions {
+    pub fn add_subscription(&mut self, topic: Topic, client_id: ClientId, qos: QoS) {
+        let clients = self.0.entry(topic).or_insert_with(HashSet::new);
+        let subscription = Subscription { client_id, qos };
+        clients.insert(subscription);
     }
 
-    pub fn _remove_subscription_client(&mut self, topic: SubscribeTopic, client_id: &ClientId) -> Result<(), Error> {
-        let topic_path = TopicPath::from_str(topic.topic_path.clone())?;
-
-        if topic_path.wildcards {
-            if let Some(clients) = self.wild.get_mut(&topic) {
-                clients.remove(client_id);
-                if clients.is_empty() {
-                    self.wild.remove(&topic);
-                }
+    pub fn _remove_subscription(&mut self, topic: &Topic, client_id: &ClientId) -> Result<(), Error> {
+        if let Some(clients) = self.0.get_mut(topic) {
+            clients.retain(|s| &s.client_id != client_id);
+            if clients.is_empty() {
+                self.0.remove(&topic);
             }
-            self.wild.retain(|_, v| !v.is_empty());
-        } else if let Some(clients) = self.concrete.get_mut(&topic) {
-            clients.remove(client_id);
-            self.concrete.retain(|_, v| !v.is_empty());
         }
+        self.0.retain(|_, v| !v.is_empty());
         Ok(())
     }
 
     /// Remove a client from all the subscriptions
     pub fn remove_client(&mut self, client_id: &ClientId) {
-        for (_, clients) in self.concrete.iter_mut() {
-            clients.remove(client_id);
+        for (_, clients) in self.0.iter_mut() {
+            clients.retain(|s| &s.client_id != client_id);
         }
-        self.concrete.retain(|_, v| !v.is_empty());
-
-        for (_, clients) in self.wild.iter_mut() {
-            clients.remove(client_id);
-        }
-        self.wild.retain(|_, v| !v.is_empty());
+        self.0.retain(|_, v| !v.is_empty());
     }
 
     /// For a given concrete topic, match topics & return list of subscribed clients
-    pub fn get_subscribed_clients(&mut self, topic: SubscribeTopic) -> Result<Vec<ClientId>, Error> {
-        let topic_path = TopicPath::from_str(topic.topic_path.clone())?;
-        let qos = topic.qos;
-
-        // subscription topic should only have concrete topic path
-        drop(topic_path.to_topic_name()?);
-
-        let mut all_clients = vec![];
-
-        // O(1) matches from concrete hashmap
-        if let Some(clients) = self.concrete.get(&topic) {
-            all_clients.extend(clients.iter().cloned());
-        }
-
-        for (subscription, clients) in self.wild.iter() {
-            let wild_subscription_topic = TopicPath::from_str(subscription.topic_path.clone())?;
-            let wild_subscription_qos = subscription.qos;
-
-            if wild_subscription_qos == qos && wild_subscription_topic.is_match(&topic_path) {
-                all_clients.extend(clients.iter().cloned());
-            }
-        }
-
-        Ok(all_clients)
+    pub fn get_subscriptions(&mut self, topic: &Topic) -> Vec<Subscription> {
+        self.0.iter().filter(|(t, _)| t == &topic).flat_map(|(_, s)| s).cloned().collect()
     }
 }
