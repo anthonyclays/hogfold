@@ -18,12 +18,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use crate::client::Connection;
 use crate::{client::Client, client_id::ClientId, subscriptions::Subscriptions};
 use bytes::Bytes;
 use hashbrown::HashMap;
 use log::{info, trace, warn};
 use mqtt_codec::{QoS, *};
 use std::{net::SocketAddr, str::FromStr};
+use stream_cancel::Valved;
 use tokio::{
     codec::Framed,
     net::TcpStream,
@@ -37,7 +39,7 @@ use tokio::{
 pub enum Event {
     Packet(SocketAddr, Packet),
     Connection((SocketAddr, TcpStream)),
-    ClientConnected(SocketAddr, Connect, mpsc::Sender<Packet>),
+    ClientConnected(Connect, Connection),
     Disconnected(SocketAddr),
 }
 
@@ -75,8 +77,9 @@ impl Broker {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::ClientConnected(addr, connect, tx) => {
-                self.handle_client_connected(addr, connect, tx);
+            Event::Connection((addr, stream)) => self.handle_connect(addr, stream),
+            Event::ClientConnected(connect, connection) => {
+                self.handle_client_connected(connect, connection);
             }
             Event::Packet(sender, packet) => {
                 self.handle_packet(sender, packet);
@@ -84,7 +87,6 @@ impl Broker {
             Event::Disconnected(addr) => {
                 self.handle_disconnect(addr);
             }
-            Event::Connection((addr, stream)) => self.handle_connect(addr, stream),
         };
     }
 
@@ -280,20 +282,22 @@ impl Broker {
         }
     }
 
-    fn handle_client_connected(&mut self, addr: SocketAddr, connect: Connect, tx: mpsc::Sender<Packet>) {
+    fn handle_client_connected(&mut self, connect: Connect, connection: Connection) {
         let id = ClientId::new(&connect.client_id);
+        let addr = connection.addr;
         let session_present = if connect.clean_session {
-            let client = Client::new(self.tx.clone(), tx, addr, connect.clean_session);
+            let client = Client::new(self.tx.clone(), true, connection);
             self.clients.insert(id.clone(), client);
             false
         } else if let Some(mut client) = self.clients.get_mut(&id) {
-            client.connection = Some(crate::client::Connection { tx, addr });
+            assert!(client.connection.is_none());
+            client.connection = Some(connection);
             client.clean_session = false;
             // TODO update session
             true
         } else {
             let id = ClientId::new(&connect.client_id);
-            let client = Client::new(self.tx.clone(), tx, addr, connect.clean_session);
+            let client = Client::new(self.tx.clone(), false, connection);
             self.clients.insert(id.clone(), client);
             false
         };
@@ -317,29 +321,32 @@ impl Broker {
             .into_future()
             .and_then(move |(packet, stream)| {
                 if let Some(Packet::Connect(connect)) = packet {
-                    trace!("{} ⟹  {:?}", addr, connect);
+                    trace!("{} → {:?}", addr, connect);
 
                     let (client_tx, client_rx) = mpsc::channel(100);
+                    let (stop_stream, stream) = Valved::new(stream);
+                    let (stop_rx, client_rx) = Valved::new(client_rx);
+
+                    let connection = Connection {
+                        tx: client_tx,
+                        addr,
+                        trigger: vec![stop_stream, stop_rx],
+                    };
 
                     broker
                         .clone()
-                        .send(Event::ClientConnected(addr, connect, client_tx))
+                        .send(Event::ClientConnected(connect, connection))
                         .wait()
                         .expect("Channel error");
 
                     // To client
-                    let tx = broker.clone();
                     tokio::spawn(
                         client_rx
-                            .map_err(|e| {
-                                warn!("Error in client Receiver: {}", e);
-                            })
-                            .inspect(move |p| trace!("{} ⟸  {:?}", addr, p))
-                            .forward(sink.sink_map_err(|e| warn!("Client rx error {:?}", e)))
-                            .map(drop)
-                            .then(move |r| {
-                                info!("{} ⟹  Connection closed: {:?}", addr, r);
-                                tx.send(Event::Disconnected(addr)).wait().expect("Channel error");
+                            .map_err(drop)
+                            .inspect(move |p| trace!("{} ← {:?}", addr, p))
+                            .forward(sink.sink_map_err(|e| warn!("{:?}", e)))
+                            .then(move |_| {
+                                info!("{} →  Connection closed (broker → client)", addr);
                                 Ok(())
                             }),
                     );
@@ -348,25 +355,25 @@ impl Broker {
                     let tx = broker.clone();
                     tokio::spawn(
                         stream
-                            .inspect(move |p| trace!("{} ⟹  {:?}", addr, p))
-                            .inspect_err(move |e| trace!("{} ⟹  {:?}", addr, e))
+                            .inspect(move |p| trace!("{} → {:?}", addr, p))
+                            .inspect_err(move |e| trace!("{} → {:?}", addr, e))
                             .map(move |p| Event::Packet(addr, p))
                             .or_else(move |e| {
-                                info!("{} ⟹  Connection closed: {:?}", addr, e);
+                                info!("{} → Connection closed: {:?}", addr, e);
                                 Ok::<_, ()>(Event::Disconnected(addr))
                             })
                             .forward(tx.sink_map_err(|e| trace!("Client Sink error {}", e)))
                             .map(move |_| {
-                                info!("{} ⟹  Connection closed", addr);
+                                info!("{} → Connection closed (client → broker)", addr);
                                 broker_done.send(Event::Disconnected(addr)).wait().expect("Channel error");
                             }),
                     );
                 } else {
-                    warn!("{} ⟹  Unexpected packet: {:?}", addr, packet);
+                    warn!("{} → Unexpected packet: {:?}", addr, packet);
                 }
                 Ok(())
             })
-            .map_err(drop)
+            .map_err(|e| warn!("Client stream error: {:?}", e))
             .map(drop);
 
         tokio::spawn(client);

@@ -22,12 +22,14 @@ use crate::broker::Event;
 use log::error;
 use mqtt_codec::{Packet, Publish, QoS};
 use std::{collections::VecDeque, net::SocketAddr};
+use stream_cancel::Trigger;
 use tokio::{prelude::*, sync::mpsc};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Connection {
     pub tx: mpsc::Sender<Packet>,
     pub addr: SocketAddr,
+    pub trigger: Vec<Trigger>,
 }
 
 trait Matches<T> {
@@ -81,9 +83,9 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(broker: mpsc::Sender<Event>, tx: mpsc::Sender<Packet>, addr: SocketAddr, clean_session: bool) -> Client {
+    pub fn new(broker: mpsc::Sender<Event>, clean_session: bool, connection: Connection) -> Client {
         Client {
-            connection: Some(Connection { tx, addr }),
+            connection: Some(connection),
             clean_session,
             last_packet_id: 0,
             broker,
