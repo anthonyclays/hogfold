@@ -238,7 +238,7 @@ impl Broker {
                         if publish.qos as u8 > s.qos as u8 {
                             publish.qos = s.qos;
                         }
-                        client.publish(publish.clone());
+                        client.publish(publish);
                     }
                 }
             }
