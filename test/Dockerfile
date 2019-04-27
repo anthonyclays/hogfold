@@ -20,7 +20,7 @@ RUN apt-get install -y mosquitto mosquitto-clients
 
 ## PREPARE THE PLAYGROUND
 RUN mkdir /home/titan/playground/ && mkdir /home/titan/playground/mqtt # && mkdir /home/titan/playground/coap
-WORKDIR /home/titan/playground
+WORKDIR /home/titan/playground/mqtt
 
 RUN mv /home/titan/iottestware/IoT-Testware/iottestware.mqtt/bin/iottestware.mqtt /home/titan/playground/mqtt \
 		&& cp /home/titan/iottestware/IoT-Testware/iottestware.mqtt/cfg/* /home/titan/playground/mqtt \
