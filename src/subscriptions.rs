@@ -27,8 +27,8 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-#[derive(Debug, Default)]
-pub struct Subscriptions(HashMap<Topic, HashSet<Subscription>>);
+#[derive(Clone, Debug, Default)]
+pub struct Subscriptions(pub HashMap<Topic, HashSet<Subscription>>);
 
 #[derive(Debug, Clone)]
 pub struct Subscription {

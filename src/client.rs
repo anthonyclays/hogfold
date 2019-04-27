@@ -18,18 +18,26 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::broker::Event;
+use crate::{broker::Event, client_id::ClientId, error::Error};
 use log::error;
 use mqtt_codec::{Packet, Publish, QoS};
-use std::{collections::VecDeque, net::SocketAddr};
+use std::collections::VecDeque;
 use stream_cancel::Trigger;
 use tokio::{prelude::*, sync::mpsc};
 
 #[derive(Debug)]
 pub struct Connection {
-    pub tx: mpsc::Sender<Packet>,
-    pub addr: SocketAddr,
-    pub trigger: Vec<Trigger>,
+    tx: mpsc::Sender<Packet>,
+    trigger: [Trigger; 2],
+}
+
+impl Connection {
+    pub fn new(tx: mpsc::Sender<Packet>, trigger: [Trigger; 2]) -> Connection {
+        Connection {
+            tx,
+            trigger,
+        }
+    }
 }
 
 trait Matches<T> {
@@ -66,7 +74,8 @@ where
 }
 
 #[derive(Debug)]
-pub struct Client {
+pub(crate) struct Client {
+    pub id: ClientId,
     pub connection: Option<Connection>,
     pub clean_session: bool,
     last_packet_id: u16,
@@ -83,8 +92,9 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(broker: mpsc::Sender<Event>, clean_session: bool, connection: Connection) -> Client {
+    pub fn new(id: ClientId, broker: mpsc::Sender<Event>, clean_session: bool, connection: Connection) -> Client {
         Client {
+            id,
             connection: Some(connection),
             clean_session,
             last_packet_id: 0,
@@ -96,63 +106,61 @@ impl Client {
         }
     }
 
-    pub fn send(&mut self, packet: Packet) {
+    pub(crate) fn send(&mut self, packet: Packet) -> Result<(), Error> {
         if let Some(ref connection) = self.connection {
             let send = connection.tx.clone().send(packet);
-            if send.wait().is_err() {
-                if self.clean_session {
-                    // TODO
-                } else {
-                    self.connection = None;
-                }
-            }
+            send.wait().map(drop).map_err(Error::ClientChannel)
+        } else {
+            Ok(())
         }
     }
 
-    pub fn publish(&mut self, mut publish: Publish) {
+    pub fn send_publish(&mut self, mut publish: Publish) -> Result<(), Error> {
         publish.packet_id = if publish.qos == QoS::AtMostOnce { None } else { Some(self.next_pkid()) };
 
         match publish.qos {
             QoS::AtLeastOnce => self.outgoing_pub.push_back(publish.clone()),
             QoS::ExactlyOnce => (),
-            _ => (),
+            QoS::AtMostOnce => (),
         }
         let packet = Packet::Publish(publish);
-        self.send(packet);
+        self.send(packet)
     }
 
-    pub fn handle_publish(&mut self, publish: &Publish) {
+    pub fn publish(&mut self, publish: &Publish) -> Result<(), Error> {
         match publish.qos {
-            QoS::AtMostOnce => (),
+            QoS::AtMostOnce => Ok(()),
             QoS::AtLeastOnce => {
                 if let Some(pkid) = publish.packet_id {
-                    self.send(Packet::PublishAck { packet_id: pkid });
+                    self.send(Packet::PublishAck { packet_id: pkid })
                 } else {
                     error!("Ignoring publish packet. No pkid for QoS1 packet");
+                    Err(Error::MissingPacketId)
                 }
             }
             QoS::ExactlyOnce => {
                 if let Some(packet_id) = publish.packet_id {
                     self.outgoing_rec.push_back(publish.clone());
-                    self.send(Packet::PublishReceived { packet_id });
+                    self.send(Packet::PublishReceived { packet_id })
                 } else {
                     error!("Ignoring record packet. No pkid for QoS2 packet");
+                    Err(Error::MissingPacketId)
                 }
             }
-        };
+        }
     }
 
-    pub fn handle_puback(&mut self, packet_id: u16) {
+    pub fn publish_ack(&mut self, packet_id: u16) -> Result<(), Error> {
         self.outgoing_pub.remove_key(&packet_id);
+        Ok(())
     }
 
-    pub fn handle_pubrel(&mut self, packet_id: u16) -> Option<Publish> {
-        self.send(Packet::PublishComplete { packet_id });
-
-        self.outgoing_rec.remove_key(&packet_id)
+    pub fn _pubrel(&mut self, packet_id: u16) -> Result<Option<Publish>, Error> {
+        self.send(Packet::PublishComplete { packet_id })?;
+        Ok(self.outgoing_rec.remove_key(&packet_id))
     }
 
-    pub fn handle_pubcomp(&mut self, packet_id: u16) {
+    pub fn _pubcomp(&mut self, packet_id: u16) {
         self.outgoing_rel.remove_key(&packet_id);
     }
 

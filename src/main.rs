@@ -17,16 +17,13 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 use failure::Error;
+use hogfold::broker;
 use log::info;
 use mqtt_codec::TCP_PORT;
 use std::{env, net::SocketAddr};
 use tokio::{net::TcpListener, prelude::*};
-
-mod broker;
-mod client;
-mod client_id;
-mod subscriptions;
 
 fn main() -> Result<(), Error> {
     #[cfg(debug_assertions)]
@@ -36,7 +33,7 @@ fn main() -> Result<(), Error> {
     env_logger::init();
 
     let mut runtime = tokio::runtime::Runtime::new()?;
-    let broker = broker::Broker::start(&mut runtime);
+    let (broker, _) = broker::Broker::start(&mut runtime);
     let v6_addr = format!("[::1]:{}", TCP_PORT).parse::<SocketAddr>().unwrap();
     let v4_addr = format!("127.0.0.1:{}", TCP_PORT).parse::<SocketAddr>().unwrap();
 
@@ -49,7 +46,6 @@ fn main() -> Result<(), Error> {
         v4_listener
             .incoming()
             .select(v6_listener.incoming())
-            .and_then(|stream| stream.peer_addr().map(|addr| (addr, stream)))
             .map(broker::Event::Connection)
             .map_err(drop)
             .forward(broker.sink_map_err(drop))

@@ -18,54 +18,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::{
-    cmp,
-    collections::hash_map::DefaultHasher,
-    fmt,
-    hash::{Hash, Hasher},
-};
-use std::sync::Arc;
+pub mod broker;
+mod client;
+mod client_id;
+mod subscriptions;
+mod error;
 
-#[derive(Clone, Debug)]
-struct Inner {
-    id: String,
-    // Cache hash for id
-    hash: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct ClientId {
-    inner: Arc<Inner>,
-}
-
-impl ClientId {
-    pub fn new(id: &str) -> ClientId {
-        let mut hasher = DefaultHasher::new();
-        id.hash(&mut hasher);
-        ClientId {
-            inner: Arc::new(Inner {
-                id: id.to_string(),
-                hash: hasher.finish(),
-            })
-        }
-    }
-}
-
-impl Hash for ClientId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.hash.hash(state);
-    }
-}
-
-impl cmp::PartialEq for ClientId {
-    fn eq(&self, other: &ClientId) -> bool {
-        self.inner.hash == other.inner.hash
-    }
-}
-impl Eq for ClientId {}
-
-impl fmt::Display for ClientId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.inner.id)
-    }
-}
+pub use mqtt_codec::Topic;
+pub use subscriptions::Subscription;
+pub use broker::Notification;
+pub use client_id::ClientId;

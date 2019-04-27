@@ -5,16 +5,24 @@ authors = ["Felix Obenhuber <felix@obenhuber.de>"]
 license = "MIT"
 edition = "2018"
 
+[lib]
+name = "hogfold"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hogfold"
+path = "src/main.rs"
+
 [dependencies]
 bytes = "0.4.12"
 env_logger = "0.6.1"
 failure = "0.1.5"
 hashbrown = "0.2.0"
 log = "0.4.6"
-mqtt-codec = { git = "https://github.com/fafhrd91/mqtt-codec.git" }
+mqtt-codec = { path = "../mqtt-codec" }
 stream-cancel = "0.4.4"
 string = "0.2.0"
-tokio = { version = "0.1.18" }
+tokio = { version = "0.1.18", features = [ "codec", "reactor", "rt-full", "sync", "tcp" ], default-features = false }
 
 [profile.test]
 debug = false
