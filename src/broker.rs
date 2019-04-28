@@ -25,18 +25,14 @@ use crate::{
     subscriptions::Subscriptions,
 };
 use bytes::Bytes;
+use futures::stream::Stream;
 use hashbrown::HashMap;
 use log::{info, trace, warn};
 use mqtt_codec::{QoS, *};
 use std::str::FromStr;
+use std::time::Duration;
 use stream_cancel::Valved;
-use tokio::{
-    codec::Framed,
-    net::TcpStream,
-    prelude::{Stream, *},
-    runtime::Runtime,
-    sync::mpsc,
-};
+use tokio::{codec::Framed, net::TcpStream, prelude::*, runtime::Runtime, sync::mpsc};
 
 type TopicString = string::String<Bytes>;
 
@@ -376,7 +372,6 @@ impl Broker {
         let (sink, stream) = Framed::new(stream, mqtt_codec::Codec::new()).split();
 
         let broker = self.event_tx.clone();
-        let broker_done = self.event_tx.clone();
 
         let client = stream
             .into_future()
@@ -390,50 +385,72 @@ impl Broker {
 
                     let client_id = ClientId::new(&connect.client_id);
                     let connection = Connection::new(client_tx, [stop_stream, stop_rx]);
+                    // Keep alive in seconds
+                    let keep_alive = connect.keep_alive;
 
-                    broker
+                    let connect = broker
                         .clone()
                         .send(Event::ClientConnected(connect, client_id.clone(), connection))
-                        .wait()
-                        .expect("Channel error");
+                        .map_err(drop);
 
-                    // To client
+                    // Outbound
                     let id = client_id.clone();
-                    let id_rx = client_id.clone();
-                    tokio::spawn(
-                        client_rx
-                            .map(move |p| (id.clone(), p))
-                            .map_err(drop)
-                            .inspect(move |(id, p)| trace!("{} ← {:?}", id, p))
-                            .map(|(_, p)| p)
-                            .forward(sink.sink_map_err(|e| warn!("{:?}", e)))
-                            .then(move |_| {
-                                info!("{} → Connection closed (broker → client)", id_rx);
-                                Ok(())
-                            }),
-                    );
+                    let outbound = client_rx
+                        .inspect(move |p| trace!("{} ← {:?}", id, p))
+                        .map_err(drop)
+                        .forward(sink.sink_map_err(|e| warn!("{:?}", e)))
+                        .map(drop);
 
-                    // From client
-                    let tx = broker.clone();
+                    // Inbound
+                    #[derive(Debug)]
+                    enum StreamError {
+                        Mqtt(mqtt_codec::ParseError),
+                        Timeout,
+                        Timer,
+                    }
+
+                    let inbound = if keep_alive == 0 {
+                        EitherStream::A(stream.map_err(StreamError::Mqtt))
+                    } else {
+                        // [MQTT-3.1.2-24] keep_alive * 1.5
+                        let timeout = Duration::from_millis(u64::from(keep_alive) * 1000 * 3 / 2);
+                        EitherStream::B(stream.timeout(timeout).map_err(|e| {
+                            if e.is_inner() {
+                                StreamError::Mqtt(e.into_inner().unwrap())
+                            } else if e.is_elapsed() {
+                                StreamError::Timeout
+                            } else {
+                                StreamError::Timer
+                            }
+                        }))
+                    };
+
                     let id = client_id.clone();
                     let id_err = client_id.clone();
+                    let disconnect = broker.clone().send(Event::Disconnected(client_id));
+                    let inbound = inbound
+                        .map(move |p| {
+                            trace!("{} → {:?}", id, p);
+                            Event::Packet(id.clone(), p)
+                        })
+                        .or_else(move |e| {
+                            // Error on connection
+                            trace!("{}:  {:?}", id_err, e);
+                            Ok::<_, ()>(Event::Disconnected(id_err.clone()))
+                        })
+                        .forward(broker.sink_map_err(|e| trace!("Client Sink error {}", e)))
+                        .then(move |_| {
+                            // Normal termination
+                            disconnect.wait().map_err(drop).map(drop)
+                        });
+
                     tokio::spawn(
-                        stream
-                            .map(move |p| (id.clone(), p))
-                            .map_err(move |e| (id_err.clone(), e))
-                            .inspect(move |(id, p)| trace!("{} → {:?}", id, p))
-                            .inspect_err(move |(id, e)| trace!("{} → {:?}", id, e))
-                            .map(move |(id, p)| Event::Packet(id.clone(), p))
-                            .or_else(move |(id, e)| {
-                                info!("{} → Connection closed: {:?}", id, e);
-                                Ok::<_, ()>(Event::Disconnected(id.clone()))
-                            })
-                            .forward(tx.sink_map_err(|e| trace!("Client Sink error {}", e)))
-                            .then(move |_| {
-                                info!("{} → Connection closed (client → broker)", client_id);
-                                broker_done.send(Event::Disconnected(client_id)).wait().expect("Channel error");
+                        connect
+                            .and_then(|_| {
+                                tokio::spawn(inbound);
+                                tokio::spawn(outbound);
                                 Ok(())
-                            }),
+                            })
                     );
                 } else {
                     warn!("Unexpected packet from: {:?}", packet);
@@ -445,5 +462,27 @@ impl Broker {
             .map(drop);
 
         tokio::spawn(client);
+    }
+}
+
+#[derive(Debug)]
+pub enum EitherStream<A, B> {
+    A(A),
+    B(B),
+}
+
+impl<A, B> Stream for EitherStream<A, B>
+where
+    A: Stream,
+    B: Stream<Item = A::Item, Error = A::Error>,
+{
+    type Item = A::Item;
+    type Error = A::Error;
+
+    fn poll(&mut self) -> Poll<Option<A::Item>, A::Error> {
+        match *self {
+            EitherStream::A(ref mut a) => a.poll(),
+            EitherStream::B(ref mut b) => b.poll(),
+        }
     }
 }
