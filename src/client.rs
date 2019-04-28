@@ -33,10 +33,7 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(tx: mpsc::Sender<Packet>, trigger: [Trigger; 2]) -> Connection {
-        Connection {
-            tx,
-            trigger,
-        }
+        Connection { tx, trigger }
     }
 }
 
@@ -120,7 +117,7 @@ impl Client {
 
         match publish.qos {
             QoS::AtLeastOnce => self.outgoing_pub.push_back(publish.clone()),
-            QoS::ExactlyOnce => (),
+            QoS::ExactlyOnce => unimplemented!(),
             QoS::AtMostOnce => (),
         }
         let packet = Packet::Publish(publish);
@@ -138,15 +135,7 @@ impl Client {
                     Err(Error::MissingPacketId)
                 }
             }
-            QoS::ExactlyOnce => {
-                if let Some(packet_id) = publish.packet_id {
-                    self.outgoing_rec.push_back(publish.clone());
-                    self.send(Packet::PublishReceived { packet_id })
-                } else {
-                    error!("Ignoring record packet. No pkid for QoS2 packet");
-                    Err(Error::MissingPacketId)
-                }
-            }
+            QoS::ExactlyOnce => unimplemented!(),
         }
     }
 
@@ -155,13 +144,14 @@ impl Client {
         Ok(())
     }
 
-    pub fn _pubrel(&mut self, packet_id: u16) -> Result<Option<Publish>, Error> {
-        self.send(Packet::PublishComplete { packet_id })?;
-        Ok(self.outgoing_rec.remove_key(&packet_id))
+    pub fn _pubrel(&mut self, packet_id: u16) -> Result<(), Error> {
+        self.outgoing_rec.remove_key(&packet_id);
+        Ok(())
     }
 
-    pub fn _pubcomp(&mut self, packet_id: u16) {
+    pub fn _pubcomp(&mut self, packet_id: u16) -> Result<(), Error> {
         self.outgoing_rel.remove_key(&packet_id);
+        Ok(())
     }
 
     fn next_pkid(&mut self) -> u16 {

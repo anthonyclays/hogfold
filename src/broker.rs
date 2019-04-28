@@ -255,35 +255,6 @@ impl Broker {
 
     fn pubrel(&mut self, _client_id: &ClientId, _packet_id: u16) -> Result<(), Error> {
         unimplemented!()
-        // if let Some(ref mut client) = self.clients.get_mut(client_id) {
-        //     let publish = client.pubrel(packet_id).expect("internal error")?;
-        //     let qos = *publish.qos;
-
-        //     match std::str::from_utf8(publish.topic.get_ref())
-        //         .map_err(drop)
-        //         .and_then(|s| Topic::from_str(s).map_err(drop))
-        //     {
-        //         Ok(topic) => {
-        //             let subscriptions = self.subscriptions.get_subscriptions(&topic);
-        //             for s in subscriptions {
-        //                 if let Some(client) = self.clients.get_mut(&s.client_id) {
-        //                     match qos {
-        //                         QoS::AtLeastOnce => client.outgoing_pub.push_back(publish.clone()),
-        //                         QoS::ExactlyOnce => client.outgoing_rec.push_back(publish.clone()),
-        //                         _ => (),
-        //                     }
-        //                     client.send(Packet::Publish(publish.clone()));
-        //                 }
-        //             }
-        //         }
-        //         Err(_) => {
-        //             warn!("Invalid topic in pubrel");
-        //             return;
-        //         }
-        //     }
-        // } else {
-        //     warn!("Cannot handle PublishRelease({}) from unknown client {}", packet_id, client_id);
-        // }
     }
 
     fn pubcomp(&mut self, _client_id: &ClientId, _packet_id: u16) -> Result<(), Error> {
@@ -292,13 +263,6 @@ impl Broker {
 
     fn pubrec(&mut self, _client_id: &ClientId, _packet_id: u16) -> Result<(), Error> {
         unimplemented!()
-        // TODO
-        // if let Some(client) = self.clients.get_mut(client_id) {
-        //     let _publish = client.pubrel(packet_id)?;
-        //     unimplemented!()
-        // } else {
-        //     Err(Error::UnknownClient(client_id.clone()))
-        // }
     }
 
     fn pingreq(&mut self, client_id: &ClientId) -> Result<(), Error> {
@@ -443,14 +407,11 @@ impl Broker {
                             disconnect.wait().map_err(drop).map(drop)
                         });
 
-                    tokio::spawn(
-                        connect
-                            .and_then(|_| {
-                                tokio::spawn(inbound);
-                                tokio::spawn(outbound);
-                                Ok(())
-                            })
-                    );
+                    tokio::spawn(connect.and_then(|_| {
+                        tokio::spawn(inbound);
+                        tokio::spawn(outbound);
+                        Ok(())
+                    }));
                 } else {
                     warn!("Unexpected packet from: {:?}", packet);
                     // Dropping stream closes the connection
