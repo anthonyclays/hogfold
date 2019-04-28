@@ -25,7 +25,6 @@ use crate::{
     subscriptions::Subscriptions,
 };
 use bytes::Bytes;
-use futures::stream::Stream;
 use hashbrown::HashMap;
 use log::{info, trace, warn};
 use mqtt_codec::{QoS, *};

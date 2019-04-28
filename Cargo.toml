@@ -23,4 +23,3 @@ mqtt-codec = { path = "../mqtt-codec" }
 stream-cancel = "0.4.4"
 string = "0.2.0"
 tokio = { version = "0.1.19", features = [ "codec", "reactor", "rt-full", "sync", "tcp" ], default-features = false }
-futures = "0.1.26"
