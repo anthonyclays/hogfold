@@ -17,15 +17,20 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#![feature(async_await, await_macro)]
 
-use failure::Error;
+use futures::{
+    compat::{Future01CompatExt, Stream01CompatExt},
+    future::{FutureExt, TryFutureExt},
+    stream::StreamExt,
+};
 use hogfold::broker;
 use log::info;
 use mqtt_codec::TCP_PORT;
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, error::Error};
 use tokio::{net::TcpListener, prelude::*};
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(debug_assertions)]
     env::set_var("RUST_LOG", "hogfold=trace");
     #[cfg(not(debug_assertions))]
@@ -34,23 +39,29 @@ fn main() -> Result<(), Error> {
 
     let mut runtime = tokio::runtime::Runtime::new()?;
     let (broker, _) = broker::Broker::start(&mut runtime);
-    let v6_addr = format!("[::1]:{}", TCP_PORT).parse::<SocketAddr>().unwrap();
-    let v4_addr = format!("127.0.0.1:{}", TCP_PORT).parse::<SocketAddr>().unwrap();
 
-    info!("Binding {}", v4_addr);
-    let v4_listener = TcpListener::bind(&v4_addr)?;
-    info!("Binding {}", v6_addr);
-    let v6_listener = TcpListener::bind(&v6_addr)?;
+    let addr = format!("127.0.0.1:{}", TCP_PORT).parse::<SocketAddr>()?;
+    info!("Binding {}", addr);
+    let v4 = TcpListener::bind(&addr)?.incoming();
 
-    tokio::run(
-        v4_listener
-            .incoming()
-            .select(v6_listener.incoming())
-            .map(broker::Event::Connection)
-            .map_err(drop)
-            .forward(broker.sink_map_err(drop))
-            .map(drop)
-            .map_err(drop),
-    );
+    let addr = format!("[::1]:{}", TCP_PORT).parse::<SocketAddr>()?;
+    info!("Binding {}", addr);
+    let v6 = TcpListener::bind(&addr)?.incoming();
+
+    let mut connections = v4.select(v6).compat();
+
+    let server = async move {
+        loop {
+            match await!(connections.next()) {
+                Some(connection) => {
+                    let connection = broker::Event::Connection(connection?);
+                    await!(broker.clone().send(connection).map(drop).compat())?;
+                }
+                None => break Ok(()),
+            }
+        }
+    };
+
+    tokio::run(server.map_err(|e: Box<dyn Error>| panic!("{}", e)).boxed().compat());
     Ok(())
 }
