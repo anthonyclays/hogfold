@@ -20,16 +20,24 @@
 
 use crate::client_id::ClientId;
 use failure::Fail;
-use tokio::sync::mpsc::error::SendError;
 
+// TODO: Should be crate private
 #[derive(Debug, Fail)]
-pub(crate) enum Error {
+pub enum Error {
     #[fail(display = "Invalid topic")]
     InvalidTopic,
     #[fail(display = "Unknown client id: {}", _0)]
     UnknownClient(ClientId),
-    #[fail(display = "Error on client connection: {}", _0)]
-    ClientChannel(SendError),
+    #[fail(display = "Error on client channel")]
+    ClientChannel,
     #[fail(display = "Missing packet id")]
     MissingPacketId,
+    #[fail(display = "Received duplicate Connect packet")]
+    DuplicateConnect,
+    #[fail(display = "Packet reception timeout")]
+    PacketTimeout,
+    #[fail(display = "IO error: {}", _0)]
+    Io(std::io::Error),
+    #[fail(display = "Protocol error: {:?}", _0)]
+    Protocol(mqtt_codec::ParseError),
 }

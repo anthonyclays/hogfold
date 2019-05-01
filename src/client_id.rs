@@ -23,8 +23,8 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
-use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct Inner {
@@ -46,7 +46,7 @@ impl ClientId {
             inner: Arc::new(Inner {
                 id: id.to_string(),
                 hash: hasher.finish(),
-            })
+            }),
         }
     }
 }

@@ -21,6 +21,5 @@ futures-preview = { version = "0.3.0-alpha.15", features = ["async-await", "nigh
 hashbrown = "0.2.0"
 log = "0.4.6"
 mqtt-codec = { path = "../mqtt-codec" }
-stream-cancel = "0.4.4"
 string = "0.2.0"
 tokio = { version = "0.1.19", features = [ "codec", "reactor", "rt-full", "sync", "tcp" ], default-features = false }

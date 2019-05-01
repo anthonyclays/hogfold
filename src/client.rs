@@ -19,21 +19,19 @@
 // SOFTWARE.
 
 use crate::{broker::Event, client_id::ClientId, error::Error};
+use futures::{channel::mpsc, prelude::*};
 use log::error;
 use mqtt_codec::{Packet, Publish, QoS};
 use std::collections::VecDeque;
-use stream_cancel::Trigger;
-use tokio::{prelude::*, sync::mpsc};
 
 #[derive(Debug)]
 pub struct Connection {
     tx: mpsc::Sender<Packet>,
-    trigger: [Trigger; 2],
 }
 
 impl Connection {
-    pub fn new(tx: mpsc::Sender<Packet>, trigger: [Trigger; 2]) -> Connection {
-        Connection { tx, trigger }
+    pub fn new(tx: mpsc::Sender<Packet>) -> Connection {
+        Connection { tx }
     }
 }
 
@@ -88,7 +86,7 @@ pub(crate) struct Client {
     pub outgoing_comp: VecDeque<u16>,
 }
 
-impl Client {
+impl<'a> Client {
     pub fn new(id: ClientId, broker: mpsc::Sender<Event>, clean_session: bool, connection: Connection) -> Client {
         Client {
             id,
@@ -103,33 +101,32 @@ impl Client {
         }
     }
 
-    pub(crate) fn send(&mut self, packet: Packet) -> Result<(), Error> {
-        if let Some(ref connection) = self.connection {
-            let send = connection.tx.clone().send(packet);
-            send.wait().map(drop).map_err(Error::ClientChannel)
+    pub(crate) async fn send(&'a mut self, packet: Packet) -> Result<(), Error> {
+        if let Some(ref mut connection) = self.connection {
+            await!(connection.tx.send(packet)).map_err(|_| Error::ClientChannel).map(drop)
         } else {
             Ok(())
         }
     }
 
-    pub fn send_publish(&mut self, mut publish: Publish) -> Result<(), Error> {
+    pub async fn send_publish(&'a mut self, mut publish: Publish) -> Result<(), Error> {
         publish.packet_id = if publish.qos == QoS::AtMostOnce { None } else { Some(self.next_pkid()) };
 
         match publish.qos {
+            QoS::AtMostOnce => (),
             QoS::AtLeastOnce => self.outgoing_pub.push_back(publish.clone()),
             QoS::ExactlyOnce => unimplemented!(),
-            QoS::AtMostOnce => (),
         }
         let packet = Packet::Publish(publish);
-        self.send(packet)
+        await!(self.send(packet))
     }
 
-    pub fn publish(&mut self, publish: &Publish) -> Result<(), Error> {
+    pub async fn publish(&'a mut self, publish: &'a Publish) -> Result<(), Error> {
         match publish.qos {
             QoS::AtMostOnce => Ok(()),
             QoS::AtLeastOnce => {
                 if let Some(pkid) = publish.packet_id {
-                    self.send(Packet::PublishAck { packet_id: pkid })
+                    await!(self.send(Packet::PublishAck { packet_id: pkid }))
                 } else {
                     error!("Ignoring publish packet. No pkid for QoS1 packet");
                     Err(Error::MissingPacketId)

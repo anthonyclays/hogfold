@@ -17,14 +17,15 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#![feature(async_await, await_macro)]
 
 pub mod broker;
 mod client;
 mod client_id;
-mod subscriptions;
 mod error;
+mod subscriptions;
 
-pub use mqtt_codec::Topic;
-pub use subscriptions::Subscription;
 pub use broker::Notification;
 pub use client_id::ClientId;
+pub use mqtt_codec::Topic;
+pub use subscriptions::Subscription;

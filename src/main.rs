@@ -20,14 +20,15 @@
 #![feature(async_await, await_macro)]
 
 use futures::{
-    compat::{Future01CompatExt, Stream01CompatExt},
+    compat::Stream01CompatExt,
     future::{FutureExt, TryFutureExt},
+    sink::SinkExt,
     stream::StreamExt,
 };
 use hogfold::broker;
 use log::info;
 use mqtt_codec::TCP_PORT;
-use std::{env, net::SocketAddr, error::Error};
+use std::{env, error::Error, net::SocketAddr};
 use tokio::{net::TcpListener, prelude::*};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -37,25 +38,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     env::set_var("RUST_LOG", "hogfold=info");
     env_logger::init();
 
-    let mut runtime = tokio::runtime::Runtime::new()?;
-    let (broker, _) = broker::Broker::start(&mut runtime);
-
-    let addr = format!("127.0.0.1:{}", TCP_PORT).parse::<SocketAddr>()?;
-    info!("Binding {}", addr);
-    let v4 = TcpListener::bind(&addr)?.incoming();
-
-    let addr = format!("[::1]:{}", TCP_PORT).parse::<SocketAddr>()?;
-    info!("Binding {}", addr);
-    let v6 = TcpListener::bind(&addr)?.incoming();
-
-    let mut connections = v4.select(v6).compat();
-
     let server = async move {
+        let (mut broker, _) = await!(broker::Broker::start());
+
+        let addr = format!("127.0.0.1:{}", TCP_PORT).parse::<SocketAddr>()?;
+        info!("Binding {}", addr);
+        let v4 = TcpListener::bind(&addr)?.incoming();
+
+        let addr = format!("[::1]:{}", TCP_PORT).parse::<SocketAddr>()?;
+        info!("Binding {}", addr);
+        let v6 = TcpListener::bind(&addr)?.incoming();
+
+        let mut connections = v4.select(v6).compat();
         loop {
             match await!(connections.next()) {
                 Some(connection) => {
                     let connection = broker::Event::Connection(connection?);
-                    await!(broker.clone().send(connection).map(drop).compat())?;
+                    await!(broker.send(connection).map(drop));
                 }
                 None => break Ok(()),
             }
