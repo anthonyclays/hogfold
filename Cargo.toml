@@ -20,6 +20,6 @@ failure = "0.1.5"
 futures-preview = { version = "0.3.0-alpha.15", features = ["async-await", "nightly", "io-compat"] }
 hashbrown = "0.2.0"
 log = "0.4.6"
-mqtt-codec = { path = "../mqtt-codec" }
+mqtt-codec = { git = "https://github.com/flxo/mqtt-codec.git" }
 string = "0.2.0"
 tokio = { version = "0.1.19", features = [ "codec", "reactor", "rt-full", "sync", "tcp" ], default-features = false }
