@@ -79,8 +79,8 @@ impl<'a> Broker {
         };
 
         let broker_loop = async move {
-            while let Some(event) = await!(rx_event.next()) {
-                await!(broker.on_event(event));
+            while let Some(event) = rx_event.next().await {
+                broker.on_event(event).await;
             }
         };
         tokio::spawn(broker_loop.unit_error().boxed().compat());
@@ -90,34 +90,34 @@ impl<'a> Broker {
 
     async fn on_event(&'a mut self, event: Event) {
         match event {
-            Event::Connection(stream) => await!(self.connection(stream)),
+            Event::Connection(stream) => self.connection(stream).await,
             Event::ClientConnected(connect, client_id, connection) => {
-                await!(self.client(connect, client_id, connection));
+                self.client(connect, client_id, connection).await;
             }
             Event::Packet(client_id, packet) => {
                 let result = match packet {
                     Packet::Subscribe {
                         packet_id,
                         ref topic_filters,
-                    } => await!(self.subscribe(&client_id, packet_id, &topic_filters)),
+                    } => self.subscribe(&client_id, packet_id, &topic_filters).await,
                     Packet::Unsubscribe {
                         packet_id,
                         ref topic_filters,
-                    } => await!(self.unsubscribe(&client_id, packet_id, &topic_filters)),
-                    Packet::Publish(ref publish) => await!(self.publish(Some(&client_id), publish)),
-                    Packet::PublishAck { packet_id } => await!(self.publish_ack(&client_id, packet_id)),
-                    Packet::PublishRelease { packet_id } => await!(self.pubrel(&client_id, packet_id)),
-                    Packet::PublishComplete { packet_id } => await!(self.pubcomp(&client_id, packet_id)),
-                    Packet::PublishReceived { packet_id } => await!(self.pubrec(&client_id, packet_id)),
-                    Packet::PingRequest => await!(self.pingreq(&client_id)),
+                    } => self.unsubscribe(&client_id, packet_id, &topic_filters).await,
+                    Packet::Publish(ref publish) => self.publish(Some(&client_id), publish).await,
+                    Packet::PublishAck { packet_id } => self.publish_ack(&client_id, packet_id).await,
+                    Packet::PublishRelease { packet_id } => self.pubrel(&client_id, packet_id).await,
+                    Packet::PublishComplete { packet_id } => self.pubcomp(&client_id, packet_id).await,
+                    Packet::PublishReceived { packet_id } => self.pubrec(&client_id, packet_id).await,
+                    Packet::PingRequest => self.pingreq(&client_id).await,
                     Packet::Disconnect => {
-                        await!(self.disconnect(&client_id, Ok(())));
+                        self.disconnect(&client_id, Ok(())).await;
                         Ok(())
                     }
                     Packet::Connect(_) => {
                         // T,,ehe connect packet is handled before. This is a Connect received on a
                         // established connection -> disconnect client
-                        await!(self.disconnect(&client_id, Err(Error::DuplicateConnect)));
+                        self.disconnect(&client_id, Err(Error::DuplicateConnect)).await;
                         Ok(())
                     }
                     p => unimplemented!("Unimplemented packet received: {:?}", p),
@@ -126,10 +126,10 @@ impl<'a> Broker {
                 match result {
                     Ok(_) => (),
                     Err(Error::UnknownClient(_)) => warn!("Unknown client - this is probably a bug"),
-                    Err(_) => await!(self.disconnect(&client_id, result)),
+                    Err(_) => self.disconnect(&client_id, result).await,
                 }
             }
-            Event::Disconnected(client_id, result) => await!(self.disconnect(&client_id, result)),
+            Event::Disconnected(client_id, result) => self.disconnect(&client_id, result).await,
             Event::Publish(topic, qos, retain, payload) => {
                 let publish = Publish {
                     dup: false,
@@ -185,25 +185,25 @@ impl<'a> Broker {
 
         // Send SubscribeAck
         let suback = Packet::SubscribeAck { packet_id, status };
-        await!(client.send(suback))?;
+        client.send(suback).await?;
 
         // Send retains
         for publish in retains.drain(..) {
-            await!(client.send_publish(publish))?;
+            client.send_publish(publish).await?;
         }
 
-        await!(self.notification(Notification::Subscriptions(self.subscriptions.clone())));
+        self.notification(Notification::Subscriptions(self.subscriptions.clone())).await;
 
         Ok(())
     }
 
     async fn unsubscribe(&'a mut self, client_id: &'a ClientId, packet_id: u16, _topic_filters: &'a [TopicString]) -> Result<(), Error> {
         let client = self.clients.get_mut(&client_id).ok_or_else(|| Error::UnknownClient(client_id.clone()))?;
-        await!(client.send(Packet::UnsubscribeAck { packet_id }))?;
+        client.send(Packet::UnsubscribeAck { packet_id }).await?;
 
         // TODO
 
-        await!(self.notification(Notification::Subscriptions(self.subscriptions.clone())));
+        self.notification(Notification::Subscriptions(self.subscriptions.clone())).await;
 
         Ok(())
     }
@@ -211,7 +211,7 @@ impl<'a> Broker {
     async fn publish(&'a mut self, client_id: Option<&'a ClientId>, publish: &'a Publish) -> Result<(), Error> {
         if let Some(client_id) = client_id {
             let client = self.clients.get_mut(&client_id).ok_or_else(|| Error::UnknownClient(client_id.clone()))?;
-            await!(client.publish(publish))?;
+            client.publish(publish).await?;
         }
 
         if publish.retain {
@@ -223,7 +223,7 @@ impl<'a> Broker {
             }
         }
 
-        await!(self.forward(publish))
+        self.forward(publish).await
     }
 
     async fn publish_ack(&'a mut self, client_id: &'a ClientId, packet_id: u16) -> Result<(), Error> {
@@ -247,7 +247,7 @@ impl<'a> Broker {
 
     async fn pingreq(&'a mut self, client_id: &'a ClientId) -> Result<(), Error> {
         let client = self.clients.get_mut(&client_id).ok_or_else(|| Error::UnknownClient(client_id.clone()))?;
-        await!(client.send(Packet::PingResponse))
+        client.send(Packet::PingResponse).await
     }
 
     async fn disconnect(&'a mut self, client_id: &'a ClientId, result: Result<(), Error>) {
@@ -269,7 +269,7 @@ impl<'a> Broker {
         self.clients.remove(&client_id);
         self.subscriptions.remove_client(&client_id);
 
-        await!(self.notification(Notification::Subscriptions(self.subscriptions.clone())));
+        self.notification(Notification::Subscriptions(self.subscriptions.clone())).await;
     }
 
     /// Forward a publication to all subscribed clients
@@ -286,7 +286,7 @@ impl<'a> Broker {
                         if publish.qos as u8 > s.qos as u8 {
                             publish.qos = s.qos;
                         }
-                        await!(client.send_publish(publish))?;
+                        client.send_publish(publish).await?;
                     }
                 }
                 Ok(())
@@ -315,7 +315,7 @@ impl<'a> Broker {
                 return_code: ConnectCode::ConnectionAccepted,
             };
 
-            match await!(client.send(connack)) {
+            match client.send(connack).await {
                 Ok(()) => drop(self.clients.insert(client_id, client)),
                 Err(_) => drop(client),
             }
@@ -345,13 +345,13 @@ impl<'a> Broker {
             let mut stream = stream.compat();
 
             // First packet on packets must be a inbound CONNECT
-            if let Ok(Packet::Connect(connect)) = await!(stream.next()).unwrap() {
+            if let Ok(Packet::Connect(connect)) = stream.next().await.unwrap() {
                 trace!("{:?}", connect);
                 let id = ClientId::new(&connect.client_id);
                 // Keep alive in seconds
                 let keep_alive = connect.keep_alive;
 
-                if await!(broker.send(Event::ClientConnected(connect, id.clone(), Connection::new(client_tx)))).is_err() {
+                if broker.send(Event::ClientConnected(connect, id.clone(), Connection::new(client_tx))).await.is_err() {
                     // TODO
                     error!("Internal broker channel error");
                     return;
@@ -386,38 +386,38 @@ impl<'a> Broker {
                 let mut packets = stream::select(tx, rx);
 
                 loop {
-                    match await!(packets.next()) {
+                    match packets.next().await {
                         Some(Forward::_Timeout) => {
                             trace!("{} → Timeout", id);
-                            await!(broker.send(Event::Disconnected(id.clone(), Err(Error::PacketTimeout)))).ok();
+                            broker.send(Event::Disconnected(id.clone(), Err(Error::PacketTimeout))).await.ok();
                             break;
                         }
                         Some(Forward::Inbound(Ok(p))) => {
                             trace!("{} → {:?}", id, p);
                             let p = Event::Packet(id.clone(), p);
-                            if await!(broker.send(p)).is_err() {
+                            if broker.send(p).await.is_err() {
                                 break;
                             }
                         }
                         Some(Forward::Outbound(p)) => {
                             trace!("{} ← {:?}", id, p);
-                            match await!(sink.send(p)) {
+                            match sink.send(p).await {
                                 Ok(_) => trace!("{} ← Success", id),
                                 Err(e) => {
                                     warn!("{} ← Error: {:?}", id, e);
-                                    await!(broker.send(Event::Disconnected(id.clone(), Err(Error::Protocol(e))))).ok();
+                                    broker.send(Event::Disconnected(id.clone(), Err(Error::Protocol(e)))).await.ok();
                                     break;
                                 }
                             }
                         }
                         None => {
                             info!("{}:  Connection closed", id);
-                            await!(broker.send(Event::Disconnected(id.clone(), Ok(())))).ok();
+                            broker.send(Event::Disconnected(id.clone(), Ok(()))).await.ok();
                             break;
                         }
                         e => {
                             warn!("{}:  Connection error: {:?}", id, e);
-                            await!(broker.send(Event::Disconnected(id.clone(), Ok(())))).ok(); // TODO: Error
+                            broker.send(Event::Disconnected(id.clone(), Ok(()))).await.ok(); // TODO: Error
                             break;
                         }
                     }

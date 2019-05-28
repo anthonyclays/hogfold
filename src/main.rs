@@ -17,7 +17,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#![feature(async_await, await_macro)]
+#![feature(async_await)]
 
 use futures::{
     compat::Stream01CompatExt,
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     let server = async move {
-        let (mut broker, _) = await!(broker::Broker::start());
+        let (mut broker, _) = broker::Broker::start().await;
 
         let addr = format!("127.0.0.1:{}", TCP_PORT).parse::<SocketAddr>()?;
         info!("Binding {}", addr);
@@ -51,10 +51,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let mut connections = v4.select(v6).compat();
         loop {
-            match await!(connections.next()) {
+            match connections.next().await {
                 Some(connection) => {
                     let connection = broker::Event::Connection(connection?);
-                    await!(broker.send(connection).map(drop));
+                    broker.send(connection).map(drop).await;
                 }
                 None => break Ok(()),
             }

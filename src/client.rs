@@ -103,7 +103,7 @@ impl<'a> Client {
 
     pub(crate) async fn send(&'a mut self, packet: Packet) -> Result<(), Error> {
         if let Some(ref mut connection) = self.connection {
-            await!(connection.tx.send(packet)).map_err(|_| Error::ClientChannel).map(drop)
+            connection.tx.send(packet).await.map_err(|_| Error::ClientChannel).map(drop)
         } else {
             Ok(())
         }
@@ -118,7 +118,7 @@ impl<'a> Client {
             QoS::ExactlyOnce => unimplemented!(),
         }
         let packet = Packet::Publish(publish);
-        await!(self.send(packet))
+        self.send(packet).await
     }
 
     pub async fn publish(&'a mut self, publish: &'a Publish) -> Result<(), Error> {
@@ -126,7 +126,7 @@ impl<'a> Client {
             QoS::AtMostOnce => Ok(()),
             QoS::AtLeastOnce => {
                 if let Some(pkid) = publish.packet_id {
-                    await!(self.send(Packet::PublishAck { packet_id: pkid }))
+                    self.send(Packet::PublishAck { packet_id: pkid }).await
                 } else {
                     error!("Ignoring publish packet. No pkid for QoS1 packet");
                     Err(Error::MissingPacketId)
